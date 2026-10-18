@@ -52,6 +52,9 @@
 (compile_entry
   (identifier) @type)
 
+(struct_value
+  name: (identifier) @type)
+
 (status_entry
   (string) @string)
 
@@ -91,6 +94,9 @@
 
 ; --- Parameters & Labels (Sky Blue / #7cc6f8 / #0a3069) ---
 (named_argument
+  name: (identifier) @variable)
+
+(struct_field
   name: (identifier) @variable)
 
 (topic_entry

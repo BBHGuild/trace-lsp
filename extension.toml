@@ -15,5 +15,6 @@ languages = ["EVM Trace"]
 
 [grammars.evm_trace]
 repository = "https://github.com/BBHGuild/tree-sitter-evm-trace"
-rev = "61ac36d18ced041fbff654e208bb04674417e5da"
+rev = "e98defd52ae41543380f40f9a79dc9505f6e76fa"
+
 

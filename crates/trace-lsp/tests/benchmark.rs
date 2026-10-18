@@ -3,21 +3,41 @@ use std::time::Instant;
 use trace_lsp::parser::TraceDocument;
 use lsp_types::SymbolKind;
 
+fn resolve_trace_path(candidates: &[&str]) -> Option<String> {
+    for &p in candidates {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
 #[test]
 fn test_benchmark_all_traces() {
-    let trace_files = [
-        "/home/sean/Github/template/test/CCC/tx-trace-V5.trace",
-        "/home/sean/Github/template/test/CCC/tx-trace-V1.trace",
-        "/home/sean/Github/template/test/CCC/test/tx-trace-test.trace",
+    let trace_groups: &[&[&str]] = &[
+        &[
+            "/home/sean/Github/template/test/CCC/tx-v5.trace",
+            "/home/sean/Github/bbhguild-backend/test/2026/08/CCC/tx-trace-V5.trace",
+            "/home/sean/Github/template/test/CCC/tx-trace-V5.trace",
+        ],
+        &[
+            "/home/sean/Github/template/test/CCC/tx-v1.trace",
+            "/home/sean/Github/bbhguild-backend/test/2026/08/CCC/tx-trace-V1.trace",
+            "/home/sean/Github/template/test/CCC/tx-trace-V1.trace",
+        ],
+        &[
+            "/home/sean/Github/template/test/CCC/tx-sender1.trace",
+            "/home/sean/Github/template/test/CCC/test/tx-trace-test.trace",
+        ],
     ];
 
-    for path in trace_files {
-        if !std::path::Path::new(path).exists() {
-            println!("Skipping non-existent: {path}");
+    for group in trace_groups {
+        let Some(path) = resolve_trace_path(group) else {
+            println!("Skipping non-existent group: {:?}", group[0]);
             continue;
-        }
+        };
 
-        let content = fs::read_to_string(path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
         let num_lines = content.lines().count();
         println!("\n=== Benchmarking: {path} ({} lines, {} bytes) ===", num_lines, content.len());
 
@@ -69,13 +89,16 @@ fn test_benchmark_all_traces() {
 
 #[test]
 fn test_deep_hierarchy_preservation() {
-    let path = "/home/sean/Github/template/test/CCC/tx-trace-V5.trace";
-    if !std::path::Path::new(path).exists() {
-        println!("Skipping deep hierarchy test, file not found: {path}");
+    let Some(path) = resolve_trace_path(&[
+        "/home/sean/Github/template/test/CCC/tx-v5.trace",
+        "/home/sean/Github/bbhguild-backend/test/2026/08/CCC/tx-trace-V5.trace",
+        "/home/sean/Github/template/test/CCC/tx-trace-V5.trace",
+    ]) else {
+        println!("Skipping deep hierarchy test, CCC V5 trace not found");
         return;
-    }
+    };
 
-    let content = fs::read_to_string(path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
     let doc = TraceDocument::parse(&content);
     let symbols = doc.to_document_symbols();
 
@@ -183,13 +206,16 @@ fn test_deep_hierarchy_preservation() {
 
 #[test]
 fn test_fox_trace_depth_clamp_and_well_formed() {
-    let path = "/home/sean/Github/template/test/Fox/tx-trace-V1.trace";
-    if !std::path::Path::new(path).exists() {
-        println!("Skipping Fox trace test, file not found: {path}");
+    let Some(path) = resolve_trace_path(&[
+        "/home/sean/Github/template/test/Fox/tx-v1.trace",
+        "/home/sean/Github/bbhguild-backend/test/2026/08/Fox/tx-trace-V1.trace",
+        "/home/sean/Github/template/test/Fox/tx-trace-V1.trace",
+    ]) else {
+        println!("Skipping Fox trace test, file not found");
         return;
-    }
+    };
 
-    let content = fs::read_to_string(path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
     let doc = TraceDocument::parse(&content);
     let start_sym = Instant::now();
     let symbols = doc.to_document_symbols();

@@ -22,13 +22,20 @@ fn truncate_addr(addr: &str) -> String {
     }
 }
 
-fn truncate_val(val: &str) -> String {
+fn truncate_chars(val: &str, max_chars: usize) -> String {
     let trimmed = val.trim();
-    if trimmed.len() > 24 {
-        format!("{}...", &trimmed[..24])
+    if trimmed.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    if let Some((byte_idx, _)) = trimmed.char_indices().nth(max_chars) {
+        format!("{}...", &trimmed[..byte_idx])
     } else {
         trimmed.to_string()
     }
+}
+
+fn truncate_val(val: &str) -> String {
+    truncate_chars(val, 24)
 }
 
 pub const MAX_SYMBOL_TREE_DEPTH: usize = 50;
@@ -87,11 +94,7 @@ fn node_symbol_info(node: &TraceNode) -> Option<(String, Option<String>, SymbolK
             SymbolKind::CONSTRUCTOR,
         ),
         TraceItemKind::Event { name: ev_name, details } => {
-            let short_details = if details.len() > 40 {
-                format!("{}...", &details[..40])
-            } else {
-                details.clone()
-            };
+            let short_details = truncate_chars(details, 40);
             (
                 format!("emit {ev_name}"),
                 Some(short_details),
@@ -126,15 +129,43 @@ fn node_symbol_info(node: &TraceNode) -> Option<(String, Option<String>, SymbolK
     Some((name, detail, kind))
 }
 
+fn utf16_len(s: &str) -> u32 {
+    if s.is_ascii() {
+        s.len() as u32
+    } else {
+        s.encode_utf16().count() as u32
+    }
+}
+
 fn symbol_ranges(node: &TraceNode, doc: &TraceDocument, name: &str) -> (Range, u32) {
     let line_text = &node.raw_line;
-    let (sel_start, sel_end) = if let Some(byte_idx) = line_text.find(name) {
-        let utf16_start = line_text[..byte_idx].encode_utf16().count() as u32;
-        let utf16_end = utf16_start + name.encode_utf16().count() as u32;
+
+    // Start at the first payload character (after `│ ├─ └─` guides and spaces).
+    // Zed builds the visible label from range.start..selection_range.end, so this
+    // yields `[2534] Token::balanceOf` instead of `│   ├─ [2534] Token::balanceOf`.
+    let mut payload_byte = 0usize;
+    let mut payload_col = 0u32;
+    for (idx, c) in line_text.char_indices() {
+        if c == ' ' || c == '\t' || matches!(c, '│' | '├' | '└' | '─') {
+            payload_byte = idx + c.len_utf8();
+            payload_col += c.len_utf16() as u32;
+        } else {
+            break;
+        }
+    }
+
+    let (sel_start, sel_end) = if let Some(rel_idx) = line_text[payload_byte..].find(name) {
+        let utf16_start = payload_col + utf16_len(&line_text[payload_byte..payload_byte + rel_idx]);
+        let utf16_end = utf16_start + utf16_len(name);
+        (utf16_start, utf16_end)
+    } else if let Some(byte_idx) = line_text.find(name) {
+        let utf16_start = utf16_len(&line_text[..byte_idx]);
+        let utf16_end = utf16_start + utf16_len(name);
         (utf16_start, utf16_end)
     } else {
         (0, doc.line_len(node.line_start))
     };
+
     let selection_range = Range {
         start: Position {
             line: node.line_start,
@@ -146,17 +177,7 @@ fn symbol_ranges(node: &TraceNode, doc: &TraceDocument, name: &str) -> (Range, u
         },
     };
 
-    // Start at the first payload character (after `│ ├─ └─` guides and spaces).
-    // Zed builds the visible label from range.start..selection_range.end, so this
-    // yields `[2534] Token::balanceOf` instead of `│   ├─ [2534] Token::balanceOf`.
-    let payload_col: u32 = line_text
-        .chars()
-        .take_while(|c| c.is_whitespace() || matches!(c, '│' | '├' | '└' | '─'))
-        .map(|c| c.len_utf16() as u32)
-        .sum::<u32>()
-        .min(sel_start);
-
-    (selection_range, payload_col)
+    (selection_range, payload_col.min(sel_start))
 }
 
 fn node_to_flat_leaf_symbol(node: &TraceNode, doc: &TraceDocument) -> Option<DocumentSymbol> {

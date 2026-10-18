@@ -91,59 +91,68 @@ pub fn extract_depth_and_payload(line: &str) -> Option<(usize, &str)> {
         return None;
     }
 
-    // Root test call, e.g. "  [1312683] CCCTest::setUp()"
-    if !line.contains('├') && !line.contains('└') && !line.contains('│') {
+    let mut num_bars = 0usize;
+    let mut prefix_chars = 0usize;
+    let mut byte_offset = 0usize;
+    let mut has_branch = false;
+
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            ' ' | '\t' => {
+                prefix_chars += 1;
+                byte_offset = idx + 1;
+            }
+            '│' => {
+                num_bars += 1;
+                prefix_chars += 1;
+                byte_offset = idx + ch.len_utf8();
+            }
+            '├' | '└' => {
+                has_branch = true;
+                byte_offset = idx + ch.len_utf8();
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    if has_branch {
+        // Consume any trailing '─' and spaces after '├' or '└'
+        let rest = &line[byte_offset..];
+        let mut extra = 0usize;
+        for ch in rest.chars() {
+            if ch == '─' || ch == ' ' {
+                extra += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let payload = line[byte_offset + extra..].trim();
+        if payload.is_empty() {
+            return None;
+        }
+        let space_depth = prefix_chars / 4;
+        let depth = space_depth.max(num_bars + 1);
+        return Some((depth, payload));
+    }
+
+    if num_bars == 0 {
         if trimmed.starts_with('[') {
             return Some((0, trimmed));
         }
     }
 
-    // Look for branch markers '├─ ' or '└─ ' or '├─' or '└─'
-    let marker = if let Some(idx) = line.find("├─") {
-        let m_len = if line[idx..].starts_with("├─ ") { "├─ ".len() } else { "├─".len() };
-        Some((idx, m_len))
-    } else if let Some(idx) = line.find("└─") {
-        let m_len = if line[idx..].starts_with("└─ ") { "└─ ".len() } else { "└─".len() };
-        Some((idx, m_len))
-    } else {
-        None
-    };
-
-    if let Some((pos, marker_len)) = marker {
-        let prefix = &line[..pos];
-        let num_bars = prefix.chars().filter(|&c| c == '│').count();
-        let space_depth = prefix.chars().count() / 4;
-        let depth = space_depth.max(num_bars + 1);
-        let payload = &line[pos + marker_len..];
-        return Some((depth, payload.trim()));
-    }
-
-    // Continuation line (e.g. storage changes '@ 0x...: ...' or event details)
-    let num_bars = line.chars().filter(|&c| c == '│').count();
-    let mut leading_chars = 0;
-    let mut byte_offset = 0;
-    for (idx, ch) in line.char_indices() {
-        if ch == ' ' || ch == '│' {
-            leading_chars += 1;
-            byte_offset = idx + ch.len_utf8();
-        } else {
-            break;
-        }
-    }
     let payload = line[byte_offset..].trim();
     if !payload.is_empty() {
-        let depth = (leading_chars / 4).max(num_bars);
+        let depth = (prefix_chars / 4).max(num_bars);
         Some((depth, payload))
     } else {
         None
     }
-
-
-
 }
 
 pub fn parse_line_kind(payload: &str) -> TraceItemKind {
-    // 1. Return / Stop / Revert
+    // 1. Return / Stop / Revert / Halt
     if payload.starts_with("←") || payload.starts_with("<-") {
         let clean = payload.trim_start_matches("←").trim_start_matches("<-").trim();
         if clean.starts_with("[Return]") {
@@ -151,14 +160,31 @@ pub fn parse_line_kind(payload: &str) -> TraceItemKind {
             return TraceItemKind::Return {
                 status: ReturnStatus::Success(val),
             };
-        } else if clean.starts_with("[Stop]") {
+        } else if clean.starts_with("[Stop]")
+            || clean.starts_with("[SelfDestruct]")
+            || clean.starts_with("[Selfdestruct]")
+        {
             return TraceItemKind::Return {
                 status: ReturnStatus::Stop,
             };
-        } else if clean.starts_with("[Revert]") {
-            let val = clean.trim_start_matches("[Revert]").trim().to_string();
+        } else if clean.starts_with('[') {
+            if let Some(close) = clean.find(']') {
+                let status_tag = &clean[1..close];
+                let rest = clean[close + 1..].trim();
+                let val = if status_tag == "Revert" {
+                    rest.to_string()
+                } else if rest.is_empty() {
+                    status_tag.to_string()
+                } else {
+                    format!("[{status_tag}] {rest}")
+                };
+                return TraceItemKind::Return {
+                    status: ReturnStatus::Revert(val),
+                };
+            }
+        } else {
             return TraceItemKind::Return {
-                status: ReturnStatus::Revert(val),
+                status: ReturnStatus::Success(clean.to_string()),
             };
         }
     }
@@ -185,26 +211,34 @@ pub fn parse_line_kind(payload: &str) -> TraceItemKind {
         }
     }
 
-    // 4. Contract Creation: "→ new Proof@0x3255..." or "[1268373] → new Proof@0x3255..."
+    // 4. Contract Creation: "→ new Proof@0x3255..." or "[1268373] → new Proof@0x3255...(0x6080...)"
     if payload.contains("→ new ") || payload.contains("-> new ") {
         let gas = parse_gas_prefix(payload).unwrap_or(0);
         let arrow_pos = payload.find("new ").unwrap_or(0);
         let spec = &payload[arrow_pos + 4..];
         let (contract, address) = if let Some(at_pos) = spec.find('@') {
-            (spec[..at_pos].trim().to_string(), spec[at_pos + 1..].trim().to_string())
+            let addr_part = spec[at_pos + 1..].trim();
+            let clean_addr = if let Some(paren_pos) = addr_part.find('(') {
+                addr_part[..paren_pos].trim().to_string()
+            } else {
+                addr_part.to_string()
+            };
+            (spec[..at_pos].trim().to_string(), clean_addr)
         } else {
             (spec.trim().to_string(), String::new())
         };
         return TraceItemKind::Create { gas, contract, address };
     }
 
-    // 5. Events: "emit Transfer(...)" or "emit topic 0: ..."
+    // 5. Events: "emit Transfer(...)" or "emit topic 0: 0x..."
     if payload.starts_with("emit ") {
         let rest = &payload[5..];
         let (name, details) = if let Some(paren) = rest.find('(') {
             (rest[..paren].trim().to_string(), rest[paren..].trim().to_string())
+        } else if let Some(colon) = rest.find(':') {
+            (rest[..colon].trim().to_string(), rest[colon + 1..].trim().to_string())
         } else {
-            (rest.to_string(), String::new())
+            (rest.trim().to_string(), String::new())
         };
         return TraceItemKind::Event { name, details };
     }
@@ -219,6 +253,12 @@ pub fn parse_line_kind(payload: &str) -> TraceItemKind {
         } else if clean_rest.ends_with("[delegatecall]") {
             call_type = CallType::DelegateCall;
             clean_rest = clean_rest.trim_end_matches("[delegatecall]").trim();
+        } else if clean_rest.ends_with("[callcode]") {
+            call_type = CallType::DelegateCall;
+            clean_rest = clean_rest.trim_end_matches("[callcode]").trim();
+        } else if clean_rest.ends_with("[call]") {
+            call_type = CallType::Call;
+            clean_rest = clean_rest.trim_end_matches("[call]").trim();
         }
 
         // Value transfer: {value: 402831596040670860741203}
@@ -287,6 +327,20 @@ impl TraceDocument {
 
         for (line_idx, line) in lines.iter().enumerate() {
             let line_num = line_idx as u32;
+            let trimmed = line.trim();
+
+            // Track "Compiling: ContractName 0xAddress" header entries
+            if let Some(comp_rest) = trimmed
+                .strip_prefix("Compiling:")
+                .or_else(|| trimmed.strip_prefix("compiling:"))
+            {
+                let parts: Vec<&str> = comp_rest.split_whitespace().collect();
+                if parts.len() == 2 && parts[1].starts_with("0x") {
+                    doc.addresses.insert(parts[1].to_string(), parts[0].to_string());
+                }
+                continue;
+            }
+
             let Some((depth, payload)) = extract_depth_and_payload(line) else {
                 continue;
             };
@@ -316,13 +370,20 @@ impl TraceDocument {
                 }
             }
 
+            // Track deployed contract addresses from Create nodes
+            if let TraceItemKind::Create { ref contract, ref address, .. } = kind {
+                if !address.is_empty() && !contract.is_empty() && contract != "<unknown>" {
+                    doc.addresses.insert(address.clone(), contract.clone());
+                }
+            }
+
             // Track contract labels from VM::label(target, "label")
             if let TraceItemKind::Call { ref target, ref function, ref args, .. } = kind {
                 if target == "VM" && function == "label" {
                     // Extract address and label from args: (0x..., "LABEL")
                     if let Some(first_comma) = args.find(',') {
                         let addr_part = &args[1..first_comma];
-                        let label_part = args[first_comma + 1..].trim_end_matches(')').trim().trim_matches('"');
+                        let label_part = args[first_comma + 1..].trim_end_matches(')').trim().trim_matches('"').trim();
                         let clean_addr = if let Some(bracket) = addr_part.find('[') {
                             let end_b = addr_part.find(']').unwrap_or(addr_part.len());
                             addr_part[bracket + 1..end_b].trim().to_string()

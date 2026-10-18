@@ -15,3 +15,6 @@
 
 (emit_trace
   name: (identifier) @name) @item
+
+(storage_header) @item
+

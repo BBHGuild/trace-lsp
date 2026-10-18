@@ -111,6 +111,28 @@ pub fn tokenize_line(line_idx: u32, line: &str, out: &mut Vec<RawToken>) {
         return;
     }
 
+    // Precompute UTF-16 cumulative offsets so start_char and length are always UTF-16 code units
+    let mut utf16_offsets = Vec::with_capacity(len + 1);
+    let mut cur_utf16 = 0u32;
+    for &c in &chars {
+        utf16_offsets.push(cur_utf16);
+        cur_utf16 += c.len_utf16() as u32;
+    }
+    utf16_offsets.push(cur_utf16);
+
+    let push_tok = |out: &mut Vec<RawToken>, start: usize, end: usize, token_type: u32| {
+        let s = utf16_offsets[start];
+        let e = utf16_offsets[end];
+        if e > s {
+            out.push(RawToken {
+                line: line_idx,
+                start_char: s,
+                length: e - s,
+                token_type,
+            });
+        }
+    };
+
     let mut i = 0;
 
     while i < len {
@@ -128,58 +150,33 @@ pub fn tokenize_line(line_idx: u32, line: &str, out: &mut Vec<RawToken>) {
             while i < len && (chars[i] == '├' || chars[i] == '└' || chars[i] == '─' || chars[i] == ' ') {
                 i += 1;
             }
-            out.push(RawToken {
-                line: line_idx,
-                start_char: start as u32,
-                length: (i - start) as u32,
-                token_type: TYPE_COMMENT,
-            });
+            push_tok(out, start, i, TYPE_COMMENT);
             continue;
         }
 
         if ch == '│' {
-            out.push(RawToken {
-                line: line_idx,
-                start_char: i as u32,
-                length: 1,
-                token_type: TYPE_COMMENT,
-            });
+            push_tok(out, i, i + 1, TYPE_COMMENT);
             i += 1;
             continue;
         }
 
         // 3. Arrow operators: →, ←
         if ch == '→' || ch == '←' {
-            out.push(RawToken {
-                line: line_idx,
-                start_char: i as u32,
-                length: 1,
-                token_type: TYPE_OPERATOR,
-            });
+            push_tok(out, i, i + 1, TYPE_OPERATOR);
             i += 1;
             continue;
         }
 
         // 4. Double colon ::
         if ch == ':' && i + 1 < len && chars[i + 1] == ':' {
-            out.push(RawToken {
-                line: line_idx,
-                start_char: i as u32,
-                length: 2,
-                token_type: TYPE_OPERATOR,
-            });
+            push_tok(out, i, i + 2, TYPE_OPERATOR);
             i += 2;
             continue;
         }
 
         // 5. Single punctuation / operators
         if ch == ':' || ch == ',' || ch == '@' || ch == '=' {
-            out.push(RawToken {
-                line: line_idx,
-                start_char: i as u32,
-                length: 1,
-                token_type: TYPE_OPERATOR,
-            });
+            push_tok(out, i, i + 1, TYPE_OPERATOR);
             i += 1;
             continue;
         }
@@ -198,12 +195,7 @@ pub fn tokenize_line(line_idx: u32, line: &str, out: &mut Vec<RawToken>) {
             if i < len && chars[i] == '"' {
                 i += 1;
             }
-            out.push(RawToken {
-                line: line_idx,
-                start_char: start as u32,
-                length: (i - start) as u32,
-                token_type: TYPE_STRING,
-            });
+            push_tok(out, start, i, TYPE_STRING);
             continue;
         }
 
@@ -221,59 +213,34 @@ pub fn tokenize_line(line_idx: u32, line: &str, out: &mut Vec<RawToken>) {
                 let inner_trimmed = inner.trim();
 
                 let token_type = match inner_trimmed {
-                    "staticcall" | "delegatecall" | "call" => Some(TYPE_MODIFIER),
-                    "Return" | "Stop" => Some(TYPE_KEYWORD),
-                    "Revert" => Some(TYPE_KEYWORD),
-                    s if s.chars().all(|c| c.is_ascii_digit()) => Some(TYPE_NUMBER),
+                    "staticcall" | "delegatecall" | "call" | "callcode" => Some(TYPE_MODIFIER),
+                    "Return" | "Stop" | "SelfDestruct" | "Selfdestruct" | "PASS" | "FAIL" => Some(TYPE_KEYWORD),
+                    "Revert" | "Panic" | "OutOfGas" | "OutOfFunds" | "CallTooDeep"
+                    | "StackOverflow" | "StackUnderflow" | "InvalidOpcode" | "InvalidFEOpcode"
+                    | "InvalidJump" | "StateChangeDuringStaticCall" | "CreateCollision"
+                    | "OverflowPayment" | "PrecompileError" | "MemoryOOG" | "MemoryLimitOOG" => Some(TYPE_KEYWORD),
+                    s if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) => Some(TYPE_NUMBER),
                     s if is_scientific_number(s) => Some(TYPE_NUMBER),
                     _ => None,
                 };
 
                 if let Some(tt) = token_type {
-                    // Output '['
-                    out.push(RawToken {
-                        line: line_idx,
-                        start_char: bracket_start as u32,
-                        length: 1,
-                        token_type: TYPE_OPERATOR,
-                    });
-                    // Output inner
-                    out.push(RawToken {
-                        line: line_idx,
-                        start_char: (bracket_start + 1) as u32,
-                        length: (j - bracket_start - 1) as u32,
-                        token_type: tt,
-                    });
-                    // Output ']'
-                    out.push(RawToken {
-                        line: line_idx,
-                        start_char: j as u32,
-                        length: 1,
-                        token_type: TYPE_OPERATOR,
-                    });
+                    push_tok(out, bracket_start, bracket_start + 1, TYPE_OPERATOR);
+                    push_tok(out, bracket_start + 1, j, tt);
+                    push_tok(out, j, j + 1, TYPE_OPERATOR);
                     i = j + 1;
                     continue;
                 }
             }
 
             // Fallback: just emit '[' as operator
-            out.push(RawToken {
-                line: line_idx,
-                start_char: i as u32,
-                length: 1,
-                token_type: TYPE_OPERATOR,
-            });
+            push_tok(out, i, i + 1, TYPE_OPERATOR);
             i += 1;
             continue;
         }
 
         if ch == ']' || ch == '(' || ch == ')' || ch == '{' || ch == '}' {
-            out.push(RawToken {
-                line: line_idx,
-                start_char: i as u32,
-                length: 1,
-                token_type: TYPE_OPERATOR,
-            });
+            push_tok(out, i, i + 1, TYPE_OPERATOR);
             i += 1;
             continue;
         }
@@ -293,27 +260,24 @@ pub fn tokenize_line(line_idx: u32, line: &str, out: &mut Vec<RawToken>) {
             } else {
                 TYPE_NUMBER // other hex literal
             };
-            out.push(RawToken {
-                line: line_idx,
-                start_char: start as u32,
-                length: hex_len as u32,
-                token_type: tt,
-            });
+            push_tok(out, start, i, tt);
             continue;
         }
 
-        // 9. Decimal numbers or scientific numbers: 416831487011304318246517, 1e18
-        if ch.is_ascii_digit() {
+        // 9. Signed or unsigned decimal numbers / scientific numbers: -20000000000, 416831487011304318246517, 1e18
+        if ch.is_ascii_digit() || ((ch == '-' || ch == '+') && i + 1 < len && chars[i + 1].is_ascii_digit()) {
             let start = i;
-            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+            if ch == '-' || ch == '+' {
                 i += 1;
             }
-            out.push(RawToken {
-                line: line_idx,
-                start_char: start as u32,
-                length: (i - start) as u32,
-                token_type: TYPE_NUMBER,
-            });
+            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                if (chars[i] == 'e' || chars[i] == 'E') && i + 1 < len && (chars[i + 1] == '+' || chars[i + 1] == '-') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            push_tok(out, start, i, TYPE_NUMBER);
             continue;
         }
 
@@ -342,12 +306,7 @@ pub fn tokenize_line(line_idx: u32, line: &str, out: &mut Vec<RawToken>) {
                 classify_word(&word)
             };
 
-            out.push(RawToken {
-                line: line_idx,
-                start_char: start as u32,
-                length: (i - start) as u32,
-                token_type,
-            });
+            push_tok(out, start, i, token_type);
             continue;
         }
 
@@ -368,6 +327,9 @@ fn is_scientific_number(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
         return false;
+    }
+    if s == ".." {
+        return true;
     }
     let has_e = s.contains('e') || s.contains('E');
     let valid_chars = s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-');
