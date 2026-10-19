@@ -49,6 +49,9 @@ pub enum TraceItemKind {
     StorageChanges {
         diffs: Vec<StorageDiff>,
     },
+    TransientChanges {
+        diffs: Vec<StorageDiff>,
+    },
     Return {
         status: ReturnStatus,
     },
@@ -189,9 +192,13 @@ pub fn parse_line_kind(payload: &str) -> TraceItemKind {
         }
     }
 
-    // 2. Storage changes header
-    if payload.starts_with("storage changes:") {
+    // 2. Storage & Transient changes headers
+    let payload_lower = payload.to_ascii_lowercase();
+    if payload_lower.starts_with("storage changes:") {
         return TraceItemKind::StorageChanges { diffs: Vec::new() };
+    }
+    if payload_lower.starts_with("transient changes:") || payload_lower.starts_with("transient storage changes:") {
+        return TraceItemKind::TransientChanges { diffs: Vec::new() };
     }
 
     // 3. Storage diff entry: "@ 0x...: old → new"

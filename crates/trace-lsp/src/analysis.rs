@@ -120,6 +120,23 @@ fn node_symbol_info(node: &TraceNode) -> Option<(String, Option<String>, SymbolK
                 SymbolKind::STRUCT,
             )
         }
+        TraceItemKind::TransientChanges { .. } => {
+            let slot_count = node
+                .children
+                .iter()
+                .filter(|c| matches!(c.kind, TraceItemKind::Other { ref text } if text.starts_with('@')))
+                .count();
+            let count_tag = if slot_count > 0 {
+                format!("{slot_count} slot{}", if slot_count == 1 { "" } else { "s" })
+            } else {
+                "transient".to_string()
+            };
+            (
+                "transient changes".to_string(),
+                Some(count_tag),
+                SymbolKind::STRUCT,
+            )
+        }
         // Individual `@ slot: before → after` lines are intentionally NOT symbols.
         // Zed converts and highlights every symbol on its UI thread, and slot diffs
         // alone made up ~30% of the payload on large traces. They remain foldable,
@@ -374,6 +391,9 @@ impl TraceDocument {
             }
             TraceItemKind::StorageChanges { .. } => {
                 md.push_str("### **STORAGE CHANGES**\n\nShows contract state modifications made in this call scope.\n");
+            }
+            TraceItemKind::TransientChanges { .. } => {
+                md.push_str("### **TRANSIENT STORAGE CHANGES (EIP-1153)**\n\nShows transient state (TSTORE) modifications made in this call scope. Discarded at transaction end.\n");
             }
             _ => {
                 md.push_str(&format!("```\n{}\n```", node.raw_line.trim()));
@@ -952,6 +972,45 @@ contract CCCTest {
             assert_eq!(loc.range.start.line, 4); // event Transfer line in vuln_sol
         } else {
             panic!("Expected scalar location for emit Transfer");
+        }
+    }
+
+    #[test]
+    fn test_transient_changes_symbols_and_hover() {
+        let trace = r#"
+  [49923] VaultTest::test_DepositWithTransientLock()
+    ├─ [44531] Vault::deposit(100000000000000000000 [1e20])
+    │   ├─ [100] TLOAD 0x0 → (0x0)
+    │   ├─ [100] TSTORE 0x0: 0x0 → 0x1
+    │   ├─  storage changes:
+    │   │   @ 0: 0 → 0x0000000000000000000000000000000000000000000000056bc75e2d63100000
+    │   ├─  transient changes:
+    │   │   @ 0: 0 → 0
+    │   │   @ 256: 0 → 0x0000000000000000000000000000000000000000000000056bc75e2d63100000
+    │   └─ ← [Stop]
+    └─ ← [Stop]
+"#;
+        let doc = TraceDocument::parse(trace);
+        let symbols = doc.to_document_symbols();
+        assert_eq!(symbols.len(), 1);
+        let root = &symbols[0];
+        assert_eq!(root.name, "VaultTest::test_DepositWithTransientLock");
+        let root_children = root.children.as_ref().unwrap();
+        assert_eq!(root_children.len(), 1);
+        let call = &root_children[0];
+        assert_eq!(call.name, "Vault::deposit");
+        let call_children = call.children.as_ref().unwrap();
+        assert_eq!(call_children.len(), 2);
+        assert_eq!(call_children[0].name, "storage changes");
+        assert_eq!(call_children[0].detail.as_deref(), Some("1 slot"));
+        assert_eq!(call_children[1].name, "transient changes");
+        assert_eq!(call_children[1].detail.as_deref(), Some("2 slots"));
+
+        let hover = doc.hover_at(Position { line: 7, character: 15 }).unwrap();
+        if let HoverContents::Markup(content) = hover.contents {
+            assert!(content.value.contains("TRANSIENT STORAGE CHANGES (EIP-1153)"));
+        } else {
+            panic!("Expected MarkupContent");
         }
     }
 }

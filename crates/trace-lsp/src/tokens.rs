@@ -338,11 +338,12 @@ fn is_scientific_number(s: &str) -> bool {
 
 fn classify_word(word: &str) -> u32 {
     match word {
-        // Solidity Keywords
+        // Solidity Keywords & Storage Opcodes
         "emit" | "new" | "return" | "returns" | "revert" | "stop" | "require" | "assert"
-        | "contract" | "interface" | "function" | "modifier" | "storage" | "changes"
+        | "contract" | "interface" | "function" | "modifier" | "storage" | "transient" | "changes"
         | "external" | "internal" | "public" | "private" | "view" | "pure" | "payable"
-        | "constant" | "immutable" | "override" | "virtual" | "memory" | "calldata" => TYPE_KEYWORD,
+        | "constant" | "immutable" | "override" | "virtual" | "memory" | "calldata"
+        | "TSTORE" | "TLOAD" | "SSTORE" | "SLOAD" => TYPE_KEYWORD,
 
         // Booleans
         "true" | "false" => TYPE_KEYWORD, // Will render with keyword/boolean emphasis

@@ -357,6 +357,11 @@ fn convert_node_to_json(node: &TraceNode) -> serde_json::Value {
             obj["badge"] = json!("STORAGE");
             obj["title"] = json!("storage changes");
         }
+        TraceItemKind::TransientChanges { .. } => {
+            obj["kind"] = json!("transient");
+            obj["badge"] = json!("TRANSIENT");
+            obj["title"] = json!("transient changes");
+        }
         TraceItemKind::Return { status } => {
             obj["kind"] = json!("return");
             obj["title"] = json!(format!("{status:?}"));
