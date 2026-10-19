@@ -1,7 +1,9 @@
 use lsp_types::{
-    DocumentHighlight, DocumentSymbol, FoldingRange, FoldingRangeKind, Hover,
-    HoverContents, MarkupContent, MarkupKind, Position, Range, SymbolKind,
+    DocumentHighlight, DocumentSymbol, FoldingRange, FoldingRangeKind,
+    GotoDefinitionResponse, Hover, HoverContents, Location, MarkupContent,
+    MarkupKind, Position, Range, SymbolKind, Url,
 };
+use std::path::{Path, PathBuf};
 use crate::parser::{CallType, TraceDocument, TraceItemKind, TraceNode};
 
 pub fn format_gas(gas: u64) -> String {
@@ -390,6 +392,436 @@ impl TraceDocument {
     pub fn highlights_at(&self, _position: Position) -> Option<Vec<DocumentHighlight>> {
         None
     }
+
+    pub fn goto_definition(&self, position: Position, trace_uri: &Url) -> Option<GotoDefinitionResponse> {
+        let line_idx = position.line;
+
+        fn find_node<'a>(nodes: &'a [TraceNode], line: u32) -> Option<&'a TraceNode> {
+            for node in nodes {
+                if node.line_start == line {
+                    return Some(node);
+                }
+                if line >= node.line_start && line <= node.line_end {
+                    if let Some(child_match) = find_node(&node.children, line) {
+                        return Some(child_match);
+                    }
+                    return Some(node);
+                }
+            }
+            None
+        }
+
+        let node = find_node(&self.roots, line_idx);
+        let query = if let Some(n) = node {
+            if n.line_start == line_idx {
+                extract_def_query_from_node(n)
+            } else {
+                extract_def_query_from_line(&n.raw_line).or_else(|| extract_def_query_from_node(n))
+            }
+        } else {
+            None
+        }?;
+
+        let trace_path = trace_uri.to_file_path().ok()?;
+        let candidate_files = find_candidate_sol_files(&trace_path);
+        if candidate_files.is_empty() {
+            return None;
+        }
+
+        let mut scored_files: Vec<(i32, PathBuf)> = candidate_files
+            .into_iter()
+            .map(|path| {
+                let score = score_file(&path, query.target_name.as_deref(), query.target_addr.as_deref());
+                (score, path)
+            })
+            .collect();
+        scored_files.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut matches = Vec::new();
+        for (score, file_path) in scored_files {
+            if !matches.is_empty() && score < 100 {
+                break;
+            }
+            if let Ok(content) = std::fs::read_to_string(&file_path) {
+                if let Ok(uri) = Url::from_file_path(&file_path) {
+                    let file_matches = find_symbol_definitions(&content, &query, &uri);
+                    matches.extend(file_matches);
+                }
+            }
+            if matches.len() >= 10 {
+                break;
+            }
+        }
+
+        if matches.is_empty() {
+            None
+        } else if matches.len() == 1 {
+            Some(GotoDefinitionResponse::Scalar(matches.remove(0)))
+        } else {
+            Some(GotoDefinitionResponse::Array(matches))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DefQueryKind {
+    Function(String),
+    Event(String),
+    Contract(String),
+}
+
+#[derive(Debug, Clone)]
+struct DefQuery {
+    target_name: Option<String>,
+    target_addr: Option<String>,
+    kind: DefQueryKind,
+}
+
+fn extract_target_parts(raw: &str) -> (Option<String>, Option<String>) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    if let Some(bracket_start) = trimmed.find('[') {
+        if let Some(bracket_end) = trimmed[bracket_start..].find(']') {
+            let addr = &trimmed[bracket_start + 1..bracket_start + bracket_end];
+            let name = trimmed[..bracket_start].trim().trim_end_matches(':').trim();
+            return (
+                if name.is_empty() { None } else { Some(name.to_string()) },
+                if addr.starts_with("0x") { Some(addr.to_string()) } else { None },
+            );
+        }
+    }
+    if let Some(paren_start) = trimmed.find('(') {
+        if let Some(paren_end) = trimmed[paren_start..].find(')') {
+            let addr = &trimmed[paren_start + 1..paren_start + paren_end];
+            let name = trimmed[..paren_start].trim();
+            return (
+                if name.is_empty() { None } else { Some(name.to_string()) },
+                if addr.starts_with("0x") { Some(addr.to_string()) } else { None },
+            );
+        }
+    }
+    if let Some(colon) = trimmed.find(':') {
+        let name = trimmed[..colon].trim();
+        let addr = trimmed[colon + 1..].trim();
+        return (
+            if name.is_empty() { None } else { Some(name.to_string()) },
+            if addr.starts_with("0x") { Some(addr.to_string()) } else { None },
+        );
+    }
+    if trimmed.starts_with("0x") {
+        (None, Some(trimmed.to_string()))
+    } else {
+        (Some(trimmed.to_string()), None)
+    }
+}
+
+fn extract_def_query_from_node(node: &TraceNode) -> Option<DefQuery> {
+    match &node.kind {
+        TraceItemKind::Call { target, function, .. }
+        | TraceItemKind::RootCall { target, function, .. } => {
+            let (target_name, target_addr) = extract_target_parts(target);
+            Some(DefQuery {
+                target_name,
+                target_addr,
+                kind: DefQueryKind::Function(function.clone()),
+            })
+        }
+        TraceItemKind::Create { contract, address, .. } => {
+            let (mut name, mut addr) = extract_target_parts(contract);
+            if addr.is_none() && address.starts_with("0x") {
+                addr = Some(address.clone());
+            }
+            if name.is_none() && !contract.starts_with("0x") {
+                name = Some(contract.clone());
+            }
+            let sym = name.clone().unwrap_or_else(|| contract.clone());
+            Some(DefQuery {
+                target_name: name,
+                target_addr: addr,
+                kind: DefQueryKind::Contract(sym),
+            })
+        }
+        TraceItemKind::Event { name, .. } => {
+            Some(DefQuery {
+                target_name: None,
+                target_addr: None,
+                kind: DefQueryKind::Event(name.clone()),
+            })
+        }
+        TraceItemKind::Other { text } => extract_def_query_from_line(text),
+        _ => None,
+    }
+}
+
+fn extract_def_query_from_line(line: &str) -> Option<DefQuery> {
+    if let Some(sep) = line.find("::") {
+        let before = line[..sep].trim();
+        let target_str = before
+            .rsplit(|c: char| c.is_whitespace() || c == ']' || c == '─' || c == '├' || c == '│')
+            .next()
+            .unwrap_or(before);
+        let after = &line[sep + 2..];
+        let func_str = after
+            .split(|c: char| c == '(' || c == '{' || c.is_whitespace())
+            .next()
+            .unwrap_or(after);
+        if !target_str.is_empty() && !func_str.is_empty() {
+            let (target_name, target_addr) = extract_target_parts(target_str);
+            return Some(DefQuery {
+                target_name,
+                target_addr,
+                kind: DefQueryKind::Function(func_str.to_string()),
+            });
+        }
+    }
+    if let Some(emit_pos) = line.find("emit ") {
+        let after = &line[emit_pos + 5..];
+        let ev_name = after
+            .split(|c: char| c == '(' || c == ':' || c.is_whitespace())
+            .next()
+            .unwrap_or(after);
+        if !ev_name.is_empty() {
+            return Some(DefQuery {
+                target_name: None,
+                target_addr: None,
+                kind: DefQueryKind::Event(ev_name.to_string()),
+            });
+        }
+    }
+    None
+}
+
+fn collect_sol_files_in_dir(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > max_depth {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "cache"
+                || name == "out"
+                || name == "artifacts"
+                || name == "target"
+                || name == "dist"
+                || name == "build"
+            {
+                continue;
+            }
+            collect_sol_files_in_dir(&path, depth + 1, max_depth, out);
+        } else if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("sol") {
+            out.push(path);
+        }
+    }
+}
+
+fn find_candidate_sol_files(trace_path: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut visited_dirs = std::collections::HashSet::new();
+
+    let start_dir = match trace_path.parent() {
+        Some(d) => d,
+        None => return files,
+    };
+
+    collect_sol_files_in_dir(start_dir, 0, 4, &mut files);
+    visited_dirs.insert(start_dir.to_path_buf());
+
+    let mut curr = start_dir.parent();
+    let mut levels = 0;
+    while let Some(parent) = curr {
+        if levels >= 4 {
+            break;
+        }
+        for sub in &["src", "test", "script", "contracts", "interfaces"] {
+            let sub_path = parent.join(sub);
+            if sub_path.is_dir() && !visited_dirs.contains(&sub_path) {
+                visited_dirs.insert(sub_path.clone());
+                collect_sol_files_in_dir(&sub_path, 0, 3, &mut files);
+            }
+        }
+        if parent.join(".git").exists() {
+            break;
+        }
+        curr = parent.parent();
+        levels += 1;
+    }
+
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn score_file(path: &Path, target_name: Option<&str>, target_addr: Option<&str>) -> i32 {
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let filename_lower = filename.to_lowercase();
+    let mut score = 0;
+
+    if let Some(addr) = target_addr {
+        let addr_clean = addr.strip_prefix("0x").unwrap_or(addr).to_lowercase();
+        if !addr_clean.is_empty() && filename_lower.contains(&addr_clean) {
+            score += 1000;
+            if filename_lower.contains("vuln") {
+                score += 200;
+            } else if filename_lower.contains("aireconstruction") || filename_lower.contains("clean") {
+                score += 150;
+            } else if filename_lower.contains("decomp") {
+                score += 50;
+            }
+        }
+    }
+
+    if let Some(name) = target_name {
+        let name_lower = name.to_lowercase();
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if stem == name_lower
+            || stem == format!("{name_lower}.t")
+            || stem == format!("{name_lower}.s")
+        {
+            score += 800;
+        } else if filename_lower.contains(&name_lower) {
+            score += 400;
+        }
+    }
+
+    let path_str = path.to_string_lossy();
+    if path_str.contains("/test/") {
+        score += 50;
+    }
+    if path_str.contains("/src/") {
+        score += 40;
+    }
+
+    score
+}
+
+fn is_function_def(line: &str, fn_name: &str) -> bool {
+    if let Some(pos) = line.find("function ") {
+        let after = line[pos + 9..].trim_start();
+        if after.starts_with(fn_name) {
+            let remainder = &after[fn_name.len()..];
+            if remainder.starts_with('(') || remainder.starts_with(' ') || remainder.starts_with('\t') {
+                return true;
+            }
+        }
+    }
+    if (fn_name == "fallback" || fn_name == "receive") && line.contains(fn_name) {
+        if let Some(pos) = line.find(fn_name) {
+            let remainder = line[pos + fn_name.len()..].trim_start();
+            if remainder.starts_with('(') {
+                return true;
+            }
+        }
+    }
+    if let Some(pos) = line.find("modifier ") {
+        let after = line[pos + 9..].trim_start();
+        if after.starts_with(fn_name) {
+            let remainder = &after[fn_name.len()..];
+            if remainder.starts_with('(')
+                || remainder.starts_with(' ')
+                || remainder.starts_with('\t')
+                || remainder.starts_with('{')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_contract_def(line: &str, contract_name: &str) -> bool {
+    for kw in &["contract ", "interface ", "library "] {
+        if let Some(pos) = line.find(kw) {
+            let after = line[pos + kw.len()..].trim_start();
+            if after.starts_with(contract_name) {
+                let remainder = &after[contract_name.len()..];
+                if remainder.is_empty()
+                    || remainder.starts_with(' ')
+                    || remainder.starts_with('{')
+                    || remainder.starts_with(" is")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    if contract_name.to_lowercase() == "constructor" || line.starts_with("constructor") || line.contains(" constructor") {
+        if let Some(pos) = line.find("constructor") {
+            let remainder = line[pos + 11..].trim_start();
+            if remainder.starts_with('(') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_event_def(line: &str, event_name: &str) -> bool {
+    if let Some(pos) = line.find("event ") {
+        let after = line[pos + 6..].trim_start();
+        if after.starts_with(event_name) {
+            let remainder = &after[event_name.len()..];
+            if remainder.starts_with('(') || remainder.starts_with(' ') || remainder.starts_with('\t') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn find_symbol_definitions(content: &str, query: &DefQuery, uri: &Url) -> Vec<Location> {
+    let mut locations = Vec::new();
+
+    for (line_idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+
+        let is_match = match &query.kind {
+            DefQueryKind::Function(fn_name) => is_function_def(trimmed, fn_name),
+            DefQueryKind::Contract(contract_name) => is_contract_def(trimmed, contract_name),
+            DefQueryKind::Event(event_name) => is_event_def(trimmed, event_name),
+        };
+
+        if is_match {
+            let symbol_name = match &query.kind {
+                DefQueryKind::Function(n) => n.as_str(),
+                DefQueryKind::Contract(n) => n.as_str(),
+                DefQueryKind::Event(n) => n.as_str(),
+            };
+
+            let start_char = if let Some(byte_pos) = line.find(symbol_name) {
+                utf16_len(&line[..byte_pos])
+            } else {
+                0
+            };
+            let end_char = start_char + utf16_len(symbol_name);
+
+            locations.push(Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position {
+                        line: line_idx as u32,
+                        character: start_char,
+                    },
+                    end: Position {
+                        line: line_idx as u32,
+                        character: end_char,
+                    },
+                },
+            });
+        }
+    }
+
+    locations
 }
 
 #[cfg(test)]
@@ -427,6 +859,100 @@ mod tests {
         // Hover test on root
         let hover = doc.hover_at(Position { line: 12, character: 4 });
         assert!(hover.is_some(), "Hover should return documentation for line 12");
+    }
+
+    #[test]
+    fn test_goto_definition() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let project_dir = temp_dir.path();
+        let src_dir = project_dir.join("src");
+        let test_dir = project_dir.join("test");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let trace_content = r#"Traces:
+  [14739827] CCCTest::test_profit_success()
+    ├─ [14716127] Proof::run()
+    │   ├─ [27962] 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c::transfer(0x1234, 100)
+    │   │   └─ emit Transfer(from: 0x1, to: 0x2, amount: 100)
+    └─ ← [Stop]
+"#;
+        let trace_path = project_dir.join("tx-v1.trace");
+        std::fs::write(&trace_path, trace_content).unwrap();
+
+        let vuln_sol = r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract WBNB {
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        emit Transfer(msg.sender, to, amount);
+        return true;
+    }
+}
+"#;
+        let vuln_path = src_dir.join("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c-AIReconstruction.sol");
+        std::fs::write(&vuln_path, vuln_sol).unwrap();
+
+        let test_sol = r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract Proof {
+    function run() external {
+    }
+}
+
+contract CCCTest {
+    function test_profit_success() public {
+    }
+}
+"#;
+        let test_sol_path = test_dir.join("CCCTest.t.sol");
+        std::fs::write(&test_sol_path, test_sol).unwrap();
+
+        let doc = TraceDocument::parse(trace_content);
+        let trace_uri = Url::from_file_path(&trace_path).unwrap();
+
+        // 1. Jump from CCCTest::test_profit_success() on line 1
+        let def1 = doc.goto_definition(Position { line: 1, character: 15 }, &trace_uri);
+        assert!(def1.is_some(), "Should find definition for CCCTest::test_profit_success");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = def1 {
+            assert!(loc.uri.as_str().contains("CCCTest.t.sol"));
+            assert_eq!(loc.range.start.line, 9); // function test_profit_success line in test_sol
+        } else {
+            panic!("Expected scalar location for test_profit_success");
+        }
+
+        // 2. Jump from Proof::run() on line 2
+        let def2 = doc.goto_definition(Position { line: 2, character: 15 }, &trace_uri);
+        assert!(def2.is_some(), "Should find definition for Proof::run");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = def2 {
+            assert!(loc.uri.as_str().contains("CCCTest.t.sol"));
+            assert_eq!(loc.range.start.line, 4); // function run line in test_sol
+        } else {
+            panic!("Expected scalar location for Proof::run");
+        }
+
+        // 3. Jump from 0xbb4CdB...::transfer on line 3
+        let def3 = doc.goto_definition(Position { line: 3, character: 20 }, &trace_uri);
+        assert!(def3.is_some(), "Should find definition for transfer in 0xbb4C...-AIReconstruction.sol");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = def3 {
+            assert!(loc.uri.as_str().contains("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c-AIReconstruction.sol"));
+            assert_eq!(loc.range.start.line, 6); // function transfer line in vuln_sol
+        } else {
+            panic!("Expected scalar location for transfer");
+        }
+
+        // 4. Jump from emit Transfer on line 4
+        let def4 = doc.goto_definition(Position { line: 4, character: 20 }, &trace_uri);
+        assert!(def4.is_some(), "Should find definition for emit Transfer");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = def4 {
+            assert!(loc.uri.as_str().contains("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c-AIReconstruction.sol"));
+            assert_eq!(loc.range.start.line, 4); // event Transfer line in vuln_sol
+        } else {
+            panic!("Expected scalar location for emit Transfer");
+        }
     }
 }
 

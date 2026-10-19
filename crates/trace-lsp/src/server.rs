@@ -114,6 +114,7 @@ fn handle_rpc(req: RpcRequest, state: &Arc<Mutex<ServerState>>) -> Option<RpcRes
                 document_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(crate::tokens::server_capabilities()),
                 ..Default::default()
             };
@@ -233,6 +234,25 @@ fn handle_rpc(req: RpcRequest, state: &Arc<Mutex<ServerState>>) -> Option<RpcRes
                 jsonrpc: "2.0".to_string(),
                 id,
                 result: Some(serde_json::to_value(hover_res).unwrap()),
+                error: None,
+            })
+        }
+        "textDocument/definition" => {
+            let mut def_res = None;
+            if let Some(params_val) = req.params {
+                if let Ok(params) = serde_json::from_value::<lsp_types::GotoDefinitionParams>(params_val) {
+                    let lock = state.lock().unwrap();
+                    let uri = &params.text_document_position_params.text_document.uri;
+                    let pos = params.text_document_position_params.position;
+                    if let Some(doc) = lock.documents.get(uri) {
+                        def_res = doc.goto_definition(pos, uri);
+                    }
+                }
+            }
+            Some(RpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(serde_json::to_value(def_res).unwrap()),
                 error: None,
             })
         }
