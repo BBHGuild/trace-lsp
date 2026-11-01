@@ -1,16 +1,16 @@
-# 🤖 AGENTS.md — Architecture & Engineering Guide for `zed-trace`
+# 🤖 AGENTS.md — Architecture & Engineering Guide for `trace-lsp`
 
-This document captures the critical design decisions, performance constraints, and protocol invariants of the `zed-trace` codebase for AI agents and human contributors.
+This document captures the critical design decisions, performance constraints, and protocol invariants of the `trace-lsp` codebase for AI agents and human contributors.
 
 ---
 
 ## 📌 Mission & Architecture
 
-`zed-trace` provides instant, native EVM and Foundry execution trace exploration in [Zed](https://zed.dev). The architecture consists of three integrated layers:
+`trace-lsp` provides instant, native EVM and Foundry execution trace exploration across LSP-compatible editors (Neovim, VS Code, Helix, Zed). The architecture consists of:
 
-1. **`tree-sitter-evm-trace`**: High-performance Tree-sitter grammar compiled to WASM (`grammars/evm_trace.wasm`), providing instant syntax highlighting in modal preview panes (`ctrl-alt-p` in Symbol Picker) and the editor buffer.
-2. **`trace-lsp` (`crates/trace-lsp`)**: Standalone Rust language server communicating over stdio JSON-RPC. Parses ASCII execution tree guides (`├─`, `│`, `└─`, `→`, `←`), gas brackets, call expressions, events, and storage diffs. Provides `textDocument/documentSymbol`, `textDocument/semanticTokens/full`, `textDocument/foldingRange`, and `textDocument/hover`.
-3. **`zed_trace` (`src/trace.rs`)**: Zed WASM extension (`extension.wasm`, `extension.toml`) that boots `trace-lsp` and registers language associations (`.trace`, `.traces`, `.sol.trace`).
+1. **`tree-sitter-evm-trace`**: High-performance Tree-sitter grammar providing instant syntax highlighting in editor buffers and symbol preview modals.
+2. **`trace-lsp`**: Standalone Rust language server communicating over stdio JSON-RPC. Parses ASCII execution tree guides (`├─`, `│`, `└─`, `→`, `←`), gas brackets, call expressions, events, and storage diffs. Provides `textDocument/documentSymbol`, `textDocument/semanticTokens/full`, `textDocument/foldingRange`, `textDocument/hover`, and `textDocument/definition`.
+3. **Legacy Zed WASM Extension**: Deprecated and archived in `deprecated/zed-extension/`. Editors now run `trace-lsp` directly via stdio.
 
 ---
 

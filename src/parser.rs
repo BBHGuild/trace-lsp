@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_parse_sample() {
-        let content = include_str!("../../../sample.trace");
+        let content = include_str!("../sample.trace");
         let doc = TraceDocument::parse(content);
         assert_eq!(doc.roots.len(), 2, "Expected 2 root test traces");
         assert_eq!(doc.roots[0].depth, 0);

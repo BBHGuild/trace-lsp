@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_entire_sample() {
-        let content = include_str!("../../../sample.trace");
+        let content = include_str!("../sample.trace");
         let sem_tokens = tokenize_document(content);
         assert!(!sem_tokens.data.is_empty(), "Document should produce semantic tokens");
     }

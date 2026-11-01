@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_sample_symbols_and_folding() {
-        let content = include_str!("../../../sample.trace");
+        let content = include_str!("../sample.trace");
         let doc = TraceDocument::parse(content);
 
         // Document symbols
